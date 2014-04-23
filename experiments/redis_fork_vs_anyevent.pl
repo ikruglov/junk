@@ -4,13 +4,19 @@ use strict;
 use warnings;
 
 use Redis;
+use AnyEvent;
 use AnyEvent::Redis;
-use Benchmark qw/:all/;
+use AnyEvent::Hiredis;
 use POSIX ":sys_wait_h";
-use Data::Dumper;
+use Benchmark qw/cmpthese/;
 
-my $data = 'A' x (10 * 1024 * 1024); # 10MB
+*STDOUT->autoflush();
+*STDERR->autoflush();
+
+my $n = $ARGV[0];
+my $data = 'A' x $ARGV[1];
 my @hosts = ( 'localhost:6379', 'localhost:6381', 'localhost:6383' );
+print "N: $n, DATA LENGTH: " . length($data) . "\n";
 
 cmpthese(10, {
     fork => sub {
@@ -19,7 +25,7 @@ cmpthese(10, {
             next if $pid; # exit in parent
 
             my $redis = Redis->new(server => $host);
-            $redis->set("_test_$_", $data) foreach (1..10);
+            $redis->set("_test_$_", $data) foreach (1..$n);
 
             undef $redis;
             POSIX::exit 0; # exit in child
@@ -28,8 +34,9 @@ cmpthese(10, {
         waitpid(-1, 0) foreach (@hosts);
     },
 
-    anyevent => sub {
+    anyevent_redis => sub {
         my @redises;
+        my $cond = AnyEvent->condvar;
         foreach my $server (@hosts) {
             my ($host, $port) = split(/:/, $server);
             my $redis = AnyEvent::Redis->new(
@@ -39,10 +46,36 @@ cmpthese(10, {
                 on_cleanup => sub { warn "Connection closed: @_" },
             );
 
-            $redis->set("_test_$_", $data) foreach (1..10);
-            $redis->all_cv()->recv();
+            foreach (1..$n) {
+                $cond->begin(sub { $cond->send() });
+                $redis->set("_test_$_", $data, sub  { $cond->end() });
+            }
+
             push @redises, $redis;
         }
+
+        $cond->recv();
+    },
+
+    anyevent_hiredis => sub {
+        my @redises;
+        my $cond = AnyEvent->condvar;
+        foreach my $server (@hosts) {
+            my ($host, $port) = split(/:/, $server);
+            my $redis = AnyEvent::Hiredis->new(
+                host => $host,
+                port => $port,
+            );
+
+            foreach (1..$n) {
+                $cond->begin(sub { $cond->send() });
+                $redis->command([ 'SET', "_test_$_", $data], sub { $cond->end() });
+            }
+
+            push @redises, $redis;
+        }
+
+        $cond->recv();
     },
 });
 
