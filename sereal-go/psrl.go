@@ -1,84 +1,65 @@
 package main
 
 import (
-    "os"
-    "fmt"
-    "time"
-    "sort"
-    "flag"
-    "io/ioutil"
-    "runtime/pprof"
-    "path/filepath"
-    "github.com/Sereal/Sereal/Go/sereal"
+	"flag"
+	"fmt"
+	"github.com/Sereal/Sereal/Go/sereal"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
 )
 
+import _ "net/http/pprof"
+
 func main() {
-    folder := flag.String("folder", ".", "folder to read *.srl files from")
-    cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
-    memprofile := flag.String("memprofile", "", "write memory profile to this file")
-    flag.Parse()
+	folder := flag.String("folder", ".", "folder to read *.srl files from")
+	flag.Parse()
 
-    files, _ := filepath.Glob(*folder + "/*.srl")
-    sort.Strings(files)
+	files, _ := filepath.Glob(*folder + "/*.srl")
+	sort.Strings(files)
 
-    if len(files) == 0 {
-        panic("no sereal files read")
-    }
+	if len(files) == 0 {
+		panic("no sereal files read")
+	}
 
-    var data []interface{}
-    dec := sereal.NewDecoder()
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
-    fmt.Fprintf(os.Stderr, "read and deserialize data\n")
-    for _, file := range files {
-        buf, ok := ioutil.ReadFile(file)
-        if ok != nil {
-            panic("failed to read file: " + file)
-        }
+	var data []interface{}
+	dec := sereal.NewDecoder()
 
-        var decoded interface{}
-        if ok := dec.Unmarshal(buf, &decoded); ok != nil {
-            panic("failed to decode file: " + file)
-        }
+	fmt.Fprintf(os.Stderr, "read and deserialize data\n")
+	for _, file := range files {
+		buf, ok := ioutil.ReadFile(file)
+		if ok != nil {
+			panic("failed to read file: " + file)
+		}
 
-        data = append(data, decoded)
-    }
+		var decoded interface{}
+		if ok := dec.Unmarshal(buf, &decoded); ok != nil {
+			panic("failed to decode file: " + file)
+		}
 
-    if *cpuprofile != "" {
-        f, err := os.Create(*cpuprofile)
-        if err != nil {
-            panic(err)
-        }
+		data = append(data, decoded)
+	}
 
-        pprof.StartCPUProfile(f)
-        defer pprof.StopCPUProfile()
-    }
+	//for {
+	t0 := time.Now()
+	fmt.Fprintf(os.Stderr, "serialize data\n")
 
-    fmt.Fprintf(os.Stderr, "serialize data\n")
-    t0 := time.Now()
+	enc := sereal.NewEncoderV3()
+	encoded, err := enc.Marshal(data)
+	if err != nil {
+		panic("failed to marshal data")
+	}
 
-    enc := sereal.NewEncoderV3()
-    encoded, err := enc.Marshal(data)
-    if err != nil {
-        fmt.Println("failed to marshal data")
-        return
-    }
-
-    t1 := time.Now()
-
-    if *memprofile != "" {
-        f, err := os.Create(*memprofile)
-        if err != nil {
-            panic(err)
-        }
-        pprof.WriteHeapProfile(f)
-        f.Close()
-        return
-    }
-
-    if *cpuprofile != "" {
-        pprof.StopCPUProfile()
-    }
-
-    fmt.Printf("%s", encoded)
-    fmt.Fprintf(os.Stderr, "The call took %v to run.\n", t1.Sub(t0))
+	t1 := time.Now()
+	fmt.Printf("%s", encoded)
+	fmt.Fprintf(os.Stderr, "The call took %v to run.\n", t1.Sub(t0))
+	//}
 }
