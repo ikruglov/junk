@@ -17,6 +17,7 @@ import _ "net/http/pprof"
 
 func main() {
 	folder := flag.String("folder", ".", "folder to read *.srl files from")
+	expsize := flag.Int("expsize", 0, "expected size of output data")
 	flag.Parse()
 
 	files, _ := filepath.Glob(*folder + "/*.srl")
@@ -53,6 +54,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "serialize data\n")
 
 	enc := sereal.NewEncoderV3()
+	enc.ExpectedSize = uint(*expsize)
 	encoded, err := enc.Marshal(data)
 	if err != nil {
 		panic("failed to marshal data")
