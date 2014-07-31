@@ -16,8 +16,14 @@ func BenchmarkAssignInfViaReflection(b *testing.B) {
     arr := make([]interface{}, b.N)
     rv := reflect.ValueOf(arr)
 
+    idxs := make([]reflect.Value, b.N)
     for i := 0; i < b.N; i++ {
-        rv.Index(i).Set(reflect.ValueOf("string"))
+        idxs[i] = rv.Index(i)
+    }
+
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        idxs[i].Set(reflect.ValueOf("string"))
     }
 }
 
@@ -32,7 +38,13 @@ func BenchmarkAssignStringViaRelfection(b *testing.B) {
     arr := make([]string, b.N)
     rv := reflect.ValueOf(arr)
 
+    idxs := make([]reflect.Value, b.N)
     for i := 0; i < b.N; i++ {
-        rv.Index(i).SetString("string")
+        idxs[i] = rv.Index(i)
+    }
+
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        idxs[i].SetString("string")
     }
 }
