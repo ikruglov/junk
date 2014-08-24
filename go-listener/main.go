@@ -12,11 +12,14 @@ import (
 	"flag"
 	"os"
 	"os/signal"
-	"runtime/pprof"
+	//"runtime/pprof"
 
 	"github.com/Sereal/Sereal/Go/sereal"
 	"github.com/couchbaselabs/go-slab"
 )
+
+import "net/http"
+import _ "net/http/pprof"
 
 const (
 	ARENA_SIZE      = 1024 * 1024 * 1024
@@ -59,6 +62,7 @@ func (a *lockedArena) Stats(m map[string]int64) map[string]int64 {
 }
 
 var Arena lockedArena
+var BigArena lockedArena
 
 //var MergerArena lockedArena
 
@@ -66,21 +70,29 @@ var Arena lockedArena
  *        MAIN CODE          *
  *****************************/
 func main() {
-	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-	var memprofile = flag.String("memprofile", "", "write memory profile to this file")
-
+	//var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+	//var memprofile = flag.String("memprofile", "", "write memory profile to this file")
+	var netprofile = flag.Bool("netprofile", false, "open socket for remote profiling")
 	flag.Parse()
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+
+	if *netprofile {
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
 	}
+
+	//	if *cpuprofile != "" {
+	//		f, err := os.Create(*cpuprofile)
+	//		if err != nil {
+	//			log.Fatal(err)
+	//		}
+	//		pprof.StartCPUProfile(f)
+	//		defer pprof.StopCPUProfile()
+	//	}
 
 	runtime.GOMAXPROCS(20)
 	Arena.arena = slab.NewArena(MAX_PACKET_SIZE, ARENA_SIZE, 2, nil)
+	BigArena.arena = slab.NewArena(1024*1024, ARENA_SIZE, 2, nil)
 
 	proto := "udp"
 	ipport := ":2005"
@@ -98,15 +110,15 @@ func main() {
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	<-c
 
-	if *memprofile != "" {
-		f, err := os.Create(*memprofile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		pprof.WriteHeapProfile(f)
-		f.Close()
-		return
-	}
+	//	if *memprofile != "" {
+	//		f, err := os.Create(*memprofile)
+	//		if err != nil {
+	//			log.Fatal(err)
+	//		}
+	//		pprof.WriteHeapProfile(f)
+	//		f.Close()
+	//		return
+	//	}
 }
 
 func udpServer(ipport string) {
@@ -120,7 +132,7 @@ func udpServer(ipport string) {
 	w := make(chan []byte, MAX_CHAN_SIZE)
 	quit := make(chan struct{})
 	done := make(chan struct{})
-	go worker(w, quit, done)
+	go dispatcher(w, quit, done)
 
 	//for i := 0; i < 100000; i++ {
 	for {
@@ -142,7 +154,7 @@ func udpServer(ipport string) {
 	<-done
 }
 
-func worker(w chan []byte, quit, done chan struct{}) {
+func dispatcher(w chan []byte, quit, done chan struct{}) {
 	var ch chan []byte
 	tick := time.Tick(1 * time.Second)
 
@@ -170,16 +182,16 @@ func worker(w chan []byte, quit, done chan struct{}) {
 func processEpoch(epoch time.Time, ch chan []byte) {
 	log.Println("start new worker for epoch", epoch.Unix())
 
-	type mergerData struct {
-		merger *sereal.Merger
-		ch     chan []byte
-		count  int
+	type mergeResult struct {
+		count int
+		size  int
+		err   error
 	}
 
 	var recvCount int
-	done := make(chan bool)
 	dec := sereal.NewDecoder()
-	mergerMap := make(map[string]*mergerData)
+	done := make(chan mergeResult)
+	mergeChannels := make(map[string]chan []byte)
 
 	for {
 		pkt, ok := <-ch
@@ -189,96 +201,102 @@ func processEpoch(epoch time.Time, ch chan []byte) {
 
 		recvCount++
 
-		data := bytes.SplitN(pkt, []byte(":"), 3)
-		if len(data) != 3 {
-			panic("received bad event")
+		// :15 is to limit search scope
+		typeEnded := bytes.IndexByte(pkt[:15], ':')
+		versionEnded := bytes.IndexByte(pkt[typeEnded+1:15], ':')
+		if versionEnded < 0 {
 			log.Println("received bad event")
+			Arena.DecRef(pkt)
 			continue
 		}
 
+		eventType := pkt[:typeEnded]
+		event := pkt[typeEnded+versionEnded+2:]
 		header := make(map[string][]byte)
-		if err := dec.UnmarshalHeader(data[2], &header); err != nil {
-			log.Println(err)
+
+		if err := dec.UnmarshalHeader(event, &header); err != nil {
+			log.Println("Failed to read header from event", string(eventType), "err:", err)
+			Arena.DecRef(pkt)
 			continue
 		}
 
 		var eventTypePersona string
-		if bytes.Equal(data[0], []byte("WEB")) {
+		if bytes.Equal(eventType, []byte("WEB")) {
 			eventTypePersona = "WEB-" + string(header["persona"])
 		} else {
-			eventTypePersona = string(data[0])
+			eventTypePersona = string(eventType)
 		}
 
-		switch eventTypePersona {
-		case "WEB-app", "WEB-xml", "WEB-sessapp":
-			mdata, ok := mergerMap[eventTypePersona]
-			if !ok {
-				mdata = &mergerData{
-					sereal.NewMerger(),
-					make(chan []byte, MAX_CHAN_SIZE),
-					0,
-				}
+		mch, ok := mergeChannels[eventTypePersona]
 
-				mdata.merger.ExpectedSize = 512 * 1024 * 1024
-				mergerMap[eventTypePersona] = mdata
-				go func(mdata *mergerData, eventType string, done chan bool) {
-					for {
-						event, ok := <-mdata.ch
-						if !ok {
-							break
-						}
+		if !ok {
+			mch = make(chan []byte, MAX_CHAN_SIZE)
+			mergeChannels[eventTypePersona] = mch
 
-						pos1 := bytes.IndexByte(event, ':')
-						pos2 := bytes.IndexByte(event[pos1+1:], ':')
+			go func(ch chan []byte, eventType string, done chan mergeResult) {
+				var err error
+				var count int
 
-						cnt, err := mdata.merger.Append(event[pos1+pos2+2:])
-						if err != nil {
-							log.Println("Failed to merge event", eventType, err)
-							panic("!!!!! 1")
-						}
+				mbuf := BigArena.Alloc(64 * 1024 * 1024)
+				merger := sereal.NewMerger()
+				merger.SetBuf(mbuf[:5])
+				//merger.ExpectedSize = 128 * 1024 * 1024 // 128 MB
 
-						mdata.count += cnt
-						Arena.DecRef(event)
+				for {
+					event, ok := <-ch
+					if !ok {
+						break
 					}
 
-					done <- true
-				}(mdata, eventTypePersona, done)
-			}
+					offset := int8(event[0])
+					if cnt, err := merger.Append(event[offset:]); err != nil {
+						log.Println("Failed to merge event", eventType, err)
+					} else {
+						count += cnt
+					}
 
-			mdata.ch <- pkt
+					Arena.DecRef(event)
+				}
 
-		default:
-			mdata, ok := mergerMap[eventTypePersona]
-			if !ok {
-				mdata = &mergerData{sereal.NewMerger(), nil, 0}
-				mergerMap[eventTypePersona] = mdata
-			}
+				res, err := merger.Finish()
+				if err == nil {
+					done <- mergeResult{count, len(res), nil}
+				} else {
+					done <- mergeResult{0, 0, err}
+				}
 
-			cnt, err := mdata.merger.Append(data[2])
-			if err != nil {
-				log.Println("failed to merge event", eventTypePersona, err)
-				panic("!!!!! 2")
-			}
+				BigArena.DecRef(mbuf)
+			}(mch, eventTypePersona, done)
+		}
 
-			mdata.count += cnt
-			Arena.DecRef(pkt)
+		// it's a trick to not send offset as separate value
+		// The ideas is that Arena.DecRef() should be fed by pkt
+		// whereas merger.Append() needs pkt[:versionEnded+1]
+		pkt[0] = byte(typeEnded + versionEnded + 2)
+		mch <- pkt
+		// TODO fix possible memleak here
+	}
+
+	// first close all channels to let worker start finishing jobs
+	for _, ch := range mergeChannels {
+		if ch != nil {
+			close(ch)
 		}
 	}
 
-	mergedCount := 0
-	for t, md := range mergerMap {
-		if md.ch != nil {
-			close(md.ch)
-			<-done
-		}
+	// now, wait for all results
 
-		md.merger.Finish()
-		mergedCount += md.count
-		log.Println(epoch.Unix(), t, md.count)
+	mergedSize := 0
+	mergedCount := 0
+	for i := 0; i < len(mergeChannels); i++ {
+		mresult := <-done
+		mergedSize += mresult.size
+		mergedCount += mresult.count
+		//log.Println(epoch.Unix(), t, mresult.count)
 	}
 
 	nextepoch := epoch.Add(1 * time.Second)
 	latency := time.Since(nextepoch)
-	log.Printf("finish processing epoch %d, latency %s, received %d, merged %d\n", epoch.Unix(), latency, recvCount, mergedCount)
+	log.Printf("finish processing epoch %d, latency %s, merged %d, mergedSize: %.2fMB\n", epoch.Unix(), latency, mergedCount, float64(mergedSize)/1024/1024)
 	//log.Printf("finish processing epoch %d, received %d\n", epoch.Unix(), recvCount)
 }
