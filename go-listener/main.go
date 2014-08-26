@@ -22,9 +22,8 @@ import "net/http"
 import _ "net/http/pprof"
 
 const (
-	ARENA_SIZE      = 1024 * 1024 * 1024
-	MAX_PACKET_SIZE = 65536
-	MAX_CHAN_SIZE   = 500000
+	START_ARENA_SIZE = 128 * 1024 * 1024
+	MAX_PACKET_SIZE  = 65536
 )
 
 /*****************************
@@ -62,9 +61,6 @@ func (a *lockedArena) Stats(m map[string]int64) map[string]int64 {
 }
 
 var Arena lockedArena
-var BigArena lockedArena
-
-//var MergerArena lockedArena
 
 /*****************************
  *        MAIN CODE          *
@@ -91,8 +87,7 @@ func main() {
 	//	}
 
 	runtime.GOMAXPROCS(20)
-	Arena.arena = slab.NewArena(MAX_PACKET_SIZE, ARENA_SIZE, 2, nil)
-	BigArena.arena = slab.NewArena(1024*1024, ARENA_SIZE, 2, nil)
+	Arena.arena = slab.NewArena(MAX_PACKET_SIZE, START_ARENA_SIZE, 2, nil)
 
 	proto := "udp"
 	ipport := ":2005"
@@ -129,24 +124,26 @@ func udpServer(ipport string) {
 
 	log.Println("UDP server started at '" + ipport + "'")
 
-	w := make(chan []byte, MAX_CHAN_SIZE)
 	quit := make(chan struct{})
 	done := make(chan struct{})
-	go dispatcher(w, quit, done)
+	dispChanIn, dispChanOut := MakeBufferedChannel()
 
-	//for i := 0; i < 100000; i++ {
+	go dispatcher(dispChanOut, quit, done)
+
 	for {
 		pkt := Arena.Alloc(MAX_PACKET_SIZE)
-		// TODO check pkt == nil
+		if pkt == nil {
+			panic("failed to allocate buffer from arena")
+		}
 
 		ln, _, err := conn.ReadFrom(pkt)
 		if err != nil {
-			panic("UDP read error")
 			log.Println("UDP read error", err)
+			Arena.DecRef(pkt)
 			continue
 		}
 
-		w <- pkt[:ln]
+		dispChanIn <- pkt[:ln]
 	}
 
 	log.Println("Shutting down..")
@@ -154,32 +151,36 @@ func udpServer(ipport string) {
 	<-done
 }
 
-func dispatcher(w chan []byte, quit, done chan struct{}) {
-	var ch chan []byte
+func dispatcher(dispChanOut <-chan []byte, quit, done chan struct{}) {
+	var epochChanIn chan<- []byte
 	tick := time.Tick(1 * time.Second)
 
 	for {
 		select {
 		case <-quit:
-			log.Println("!!!")
+			if epochChanIn != nil {
+				close(epochChanIn)
+			}
+
 			done <- struct{}{}
 			return
 
 		case epoch := <-tick:
-			if ch != nil {
-				close(ch)
+			if epochChanIn != nil {
+				close(epochChanIn)
 			}
 
-			ch = make(chan []byte, MAX_CHAN_SIZE)
-			go processEpoch(epoch, ch)
+			in, out := MakeBufferedChannel()
+			go processEpoch(epoch, out)
+			epochChanIn = in
 
-		case pkt := <-w:
-			ch <- pkt
+		case pkt := <-dispChanOut:
+			epochChanIn <- pkt
 		}
 	}
 }
 
-func processEpoch(epoch time.Time, ch chan []byte) {
+func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 	log.Println("start new worker for epoch", epoch.Unix())
 
 	type mergeResult struct {
@@ -191,10 +192,10 @@ func processEpoch(epoch time.Time, ch chan []byte) {
 	var recvCount int
 	dec := sereal.NewDecoder()
 	done := make(chan mergeResult)
-	mergeChannels := make(map[string]chan []byte)
+	mergeChannels := make(map[string]chan<- []byte)
 
 	for {
-		pkt, ok := <-ch
+		pkt, ok := <-epochChanOut
 		if !ok {
 			break
 		}
@@ -227,23 +228,19 @@ func processEpoch(epoch time.Time, ch chan []byte) {
 			eventTypePersona = string(eventType)
 		}
 
-		mch, ok := mergeChannels[eventTypePersona]
+		mergerChanIn, ok := mergeChannels[eventTypePersona]
 
 		if !ok {
-			mch = make(chan []byte, MAX_CHAN_SIZE)
-			mergeChannels[eventTypePersona] = mch
+			in, out := MakeBufferedChannel()
+			mergeChannels[eventTypePersona] = in
+			mergerChanIn = in
 
-			go func(ch chan []byte, eventType string, done chan mergeResult) {
-				var err error
+			go func(mergerChanOut <-chan []byte, eventType string, done chan mergeResult) {
 				var count int
-
-				mbuf := BigArena.Alloc(64 * 1024 * 1024)
 				merger := sereal.NewMerger()
-				merger.SetBuf(mbuf[:5])
-				//merger.ExpectedSize = 128 * 1024 * 1024 // 128 MB
 
 				for {
-					event, ok := <-ch
+					event, ok := <-mergerChanOut
 					if !ok {
 						break
 					}
@@ -258,23 +255,19 @@ func processEpoch(epoch time.Time, ch chan []byte) {
 					Arena.DecRef(event)
 				}
 
-				res, err := merger.Finish()
-				if err == nil {
+				if res, err := merger.Finish(); err == nil {
 					done <- mergeResult{count, len(res), nil}
 				} else {
 					done <- mergeResult{0, 0, err}
 				}
-
-				BigArena.DecRef(mbuf)
-			}(mch, eventTypePersona, done)
+			}(out, eventTypePersona, done)
 		}
 
 		// it's a trick to not send offset as separate value
 		// The ideas is that Arena.DecRef() should be fed by pkt
 		// whereas merger.Append() needs pkt[:versionEnded+1]
 		pkt[0] = byte(typeEnded + versionEnded + 2)
-		mch <- pkt
-		// TODO fix possible memleak here
+		mergerChanIn <- pkt
 	}
 
 	// first close all channels to let worker start finishing jobs
