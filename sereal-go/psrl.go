@@ -54,7 +54,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "serialize data\n")
 
 	enc := sereal.NewEncoderV3()
+	enc.PerlCompat = true
 	enc.ExpectedSize = uint(*expsize)
+
 	encoded, err := enc.Marshal(data)
 	if err != nil {
 		panic("failed to marshal data")
