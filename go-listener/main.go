@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"log"
 	"net"
 	"os"
@@ -80,12 +81,15 @@ func main() {
 		}()
 	}
 
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(10)
 	Arena.arena = slab.NewArena(MAX_PACKET_SIZE, START_ARENA_SIZE, 2, nil)
 
 	switch *proto {
 	case "udp":
 		go udpServer(*host + ":" + strconv.Itoa(*port))
+
+	case "tcp":
+		go tcpServer(*host + ":" + strconv.Itoa(*port))
 
 	default:
 		log.Fatal("unknown protocol")
@@ -94,6 +98,81 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	<-c
+}
+
+func tcpServer(ipport string) {
+	l, e := net.Listen("tcp", ipport)
+	if e != nil {
+		log.Fatal("UDP listen error:", e)
+	}
+
+	defer l.Close()
+	log.Println("TCP server started at '" + ipport + "'")
+
+	/* exiting from udpServer makes dispatcher() exit */
+	quit := make(chan struct{})
+	done := make(chan struct{})
+	dispChanIn, dispChanOut := MakeBufferedChannel()
+
+	go dispatcher(dispChanOut, quit, done)
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		go func(c net.Conn) {
+			defer func() {
+				c.Close()
+				log.Println("connection terminated " + c.RemoteAddr().String())
+			}()
+
+			log.Println("new connection accepted " + c.RemoteAddr().String())
+			var pkt []byte
+
+			for {
+				pkt = Arena.Alloc(MAX_PACKET_SIZE)
+				if pkt == nil {
+					panic("failed to allocate buffer from arena")
+				}
+
+				ln, err := conn.Read(pkt[:4])
+				if err != nil {
+					log.Println("TCP read error", err)
+					break
+				}
+
+				var size uint32
+				reader := bytes.NewReader(pkt)
+				if err := binary.Read(reader, binary.LittleEndian, &size); err != nil {
+					log.Println("Failed to read packet's size")
+					break
+				}
+
+				if size < 4 || size > MAX_PACKET_SIZE {
+					log.Println("got too long packet length:", size)
+					break
+				}
+
+				ln, err = conn.Read(pkt[:size])
+				if err != nil {
+					log.Println("TCP read error", err)
+					break
+				}
+
+				dispChanIn <- pkt[:ln]
+			}
+
+			if pkt != nil {
+				Arena.DecRef(pkt)
+			}
+		}(conn)
+	}
+
+	log.Println("Shutting down UDP server at '" + ipport + "'")
+	close(quit)
+	<-done
 }
 
 func udpServer(ipport string) {
