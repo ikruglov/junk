@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"flag"
-	"os"
-	"os/signal"
-	//"runtime/pprof"
 
 	"github.com/Sereal/Sereal/Go/sereal"
 	"github.com/couchbaselabs/go-slab"
@@ -60,14 +60,17 @@ func (a *lockedArena) Stats(m map[string]int64) map[string]int64 {
 	return m2
 }
 
+/* global variables */
 var Arena lockedArena
 
 /*****************************
  *        MAIN CODE          *
  *****************************/
 func main() {
-	//var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-	//var memprofile = flag.String("memprofile", "", "write memory profile to this file")
+	var proto = flag.String("proto", "udp", "proto TCP or UDP, default UDP")
+	var host = flag.String("host", "localhost", "host, default localhost")
+	var port = flag.Int("port", 2015, "port, default 2015")
+
 	var netprofile = flag.Bool("netprofile", false, "open socket for remote profiling")
 	flag.Parse()
 
@@ -77,43 +80,20 @@ func main() {
 		}()
 	}
 
-	//	if *cpuprofile != "" {
-	//		f, err := os.Create(*cpuprofile)
-	//		if err != nil {
-	//			log.Fatal(err)
-	//		}
-	//		pprof.StartCPUProfile(f)
-	//		defer pprof.StopCPUProfile()
-	//	}
-
-	runtime.GOMAXPROCS(20)
+	runtime.GOMAXPROCS(2)
 	Arena.arena = slab.NewArena(MAX_PACKET_SIZE, START_ARENA_SIZE, 2, nil)
 
-	proto := "udp"
-	ipport := ":2005"
-
-	switch proto {
+	switch *proto {
 	case "udp":
-		go udpServer(ipport)
+		go udpServer(*host + ":" + strconv.Itoa(*port))
 
 	default:
 		log.Fatal("unknown protocol")
 	}
 
-	// setup signal handler
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	<-c
-
-	//	if *memprofile != "" {
-	//		f, err := os.Create(*memprofile)
-	//		if err != nil {
-	//			log.Fatal(err)
-	//		}
-	//		pprof.WriteHeapProfile(f)
-	//		f.Close()
-	//		return
-	//	}
 }
 
 func udpServer(ipport string) {
@@ -124,6 +104,7 @@ func udpServer(ipport string) {
 
 	log.Println("UDP server started at '" + ipport + "'")
 
+	/* exiting from udpServer makes dispatcher() exit */
 	quit := make(chan struct{})
 	done := make(chan struct{})
 	dispChanIn, dispChanOut := MakeBufferedChannel()
@@ -146,7 +127,7 @@ func udpServer(ipport string) {
 		dispChanIn <- pkt[:ln]
 	}
 
-	log.Println("Shutting down..")
+	log.Println("Shutting down UDP server at '" + ipport + "'")
 	close(quit)
 	<-done
 }
@@ -154,6 +135,8 @@ func udpServer(ipport string) {
 func dispatcher(dispChanOut <-chan []byte, quit, done chan struct{}) {
 	var epochChanIn chan<- []byte
 	tick := time.Tick(1 * time.Second)
+
+	/* processEpoch are standalone go routines */
 
 	for {
 		select {
@@ -171,8 +154,9 @@ func dispatcher(dispChanOut <-chan []byte, quit, done chan struct{}) {
 			}
 
 			in, out := MakeBufferedChannel()
-			go processEpoch(epoch, out)
 			epochChanIn = in
+
+			go processEpoch(epoch, out)
 
 		case pkt := <-dispChanOut:
 			epochChanIn <- pkt
@@ -190,8 +174,10 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 	}
 
 	var recvCount int
+	var wg sync.WaitGroup
+	var header map[string][]byte
+
 	dec := sereal.NewDecoder()
-	done := make(chan mergeResult)
 	mergeChannels := make(map[string]chan<- []byte)
 
 	for {
@@ -213,7 +199,6 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 
 		eventType := pkt[:typeEnded]
 		event := pkt[typeEnded+versionEnded+2:]
-		header := make(map[string][]byte)
 
 		if err := dec.UnmarshalHeader(event, &header); err != nil {
 			log.Println("Failed to read header from event", string(eventType), "err:", err)
@@ -235,9 +220,12 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 			mergeChannels[eventTypePersona] = in
 			mergerChanIn = in
 
-			go func(mergerChanOut <-chan []byte, eventType string, done chan mergeResult) {
-				var count int
+			go func(mergerChanOut <-chan []byte, eventType string) {
+				wg.Add(1)
+				defer wg.Done()
+
 				merger := sereal.NewMerger()
+				//merger.Compression = sereal.SnappyCompressor{Incremental: true}
 
 				for {
 					event, ok := <-mergerChanOut
@@ -246,21 +234,13 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 					}
 
 					offset := int8(event[0])
-					if cnt, err := merger.Append(event[offset:]); err != nil {
+					if _, err := merger.Append(event[offset:]); err != nil {
 						log.Println("Failed to merge event", eventType, err)
-					} else {
-						count += cnt
 					}
 
 					Arena.DecRef(event)
 				}
-
-				if res, err := merger.Finish(); err == nil {
-					done <- mergeResult{count, len(res), nil}
-				} else {
-					done <- mergeResult{0, 0, err}
-				}
-			}(out, eventTypePersona, done)
+			}(out, eventTypePersona)
 		}
 
 		// it's a trick to not send offset as separate value
@@ -277,19 +257,11 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 		}
 	}
 
-	// now, wait for all results
+	// wait all workers
+	wg.Wait()
 
-	mergedSize := 0
-	mergedCount := 0
-	for i := 0; i < len(mergeChannels); i++ {
-		mresult := <-done
-		mergedSize += mresult.size
-		mergedCount += mresult.count
-		//log.Println(epoch.Unix(), t, mresult.count)
+	if recvCount > 0 {
+		latency := time.Since(epoch.Add(1 * time.Second))
+		log.Printf("finish processing epoch %d, latency %s, merged %d\n", epoch.Unix(), latency, recvCount)
 	}
-
-	nextepoch := epoch.Add(1 * time.Second)
-	latency := time.Since(nextepoch)
-	log.Printf("finish processing epoch %d, latency %s, merged %d, mergedSize: %.2fMB\n", epoch.Unix(), latency, mergedCount, float64(mergedSize)/1024/1024)
-	//log.Printf("finish processing epoch %d, received %d\n", epoch.Unix(), recvCount)
 }
