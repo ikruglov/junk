@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -23,8 +24,11 @@ import "net/http"
 import _ "net/http/pprof"
 
 const (
-	START_ARENA_SIZE = 128 * 1024 * 1024
-	MAX_PACKET_SIZE  = 65536
+	GOMAXPROCS                = 10
+	ARENA_SMALLEST_SLAB_CLASS = 128
+	ARENA_START_SIZE          = 128 * 1024 * 1024
+	ARENA_GROW_FACTOR         = 2
+	MAX_PACKET_SIZE           = 65536
 )
 
 /*****************************
@@ -81,8 +85,9 @@ func main() {
 		}()
 	}
 
-	runtime.GOMAXPROCS(10)
-	Arena.arena = slab.NewArena(MAX_PACKET_SIZE, START_ARENA_SIZE, 2, nil)
+	runtime.GOMAXPROCS(GOMAXPROCS)
+
+	Arena.arena = slab.NewArena(ARENA_SMALLEST_SLAB_CLASS, ARENA_START_SIZE, ARENA_GROW_FACTOR, nil)
 
 	switch *proto {
 	case "udp":
@@ -101,76 +106,91 @@ func main() {
 }
 
 func tcpServer(ipport string) {
-	l, e := net.Listen("tcp", ipport)
-	if e != nil {
-		log.Fatal("UDP listen error:", e)
+	listener, err := net.Listen("tcp", ipport)
+	if err != nil {
+		log.Fatal("UDP listen error:", err)
 	}
 
-	defer l.Close()
+	defer listener.Close()
 	log.Println("TCP server started at '" + ipport + "'")
 
 	/* exiting from udpServer makes dispatcher() exit */
 	quit := make(chan struct{})
 	done := make(chan struct{})
-	dispChanIn, dispChanOut := MakeBufferedChannel()
+	dispChan := make(chan []byte)
+	//dispChanIn, dispChanOut := MakeBufferedChannel()
 
-	go dispatcher(dispChanOut, quit, done)
+	go dispatcher(dispChan, quit, done)
+	//go dispatcher(dispChanOut, quit, done)
 
 	for {
-		conn, err := l.Accept()
+		c, err := listener.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		go func(c net.Conn) {
+		go func(conn net.Conn) {
+			var err error
+			var pkt []byte
+			conn_addr := c.RemoteAddr().String()
+
 			defer func() {
-				c.Close()
-				log.Println("connection terminated " + c.RemoteAddr().String())
+				conn.Close()
+
+				if err == io.EOF {
+					log.Println("client disconnected", conn_addr)
+				} else if err != nil {
+					log.Println("failed to receive data from", conn_addr, err)
+				} else {
+					log.Println("server disconnected client", conn_addr)
+				}
+
+				if pkt != nil {
+					Arena.DecRef(pkt)
+				}
 			}()
 
-			log.Println("new connection accepted " + c.RemoteAddr().String())
-			var pkt []byte
+			log.Println("new connection accepted", conn_addr)
+
+			var ln int
+			var size int32
+			var offset uint32
 
 			for {
-				pkt = Arena.Alloc(MAX_PACKET_SIZE)
-				if pkt == nil {
-					panic("failed to allocate buffer from arena")
-				}
+				size = 0
+				offset = 0
+				pkt = nil
 
-				ln, err := conn.Read(pkt[:4])
-				if err != nil {
-					log.Println("TCP read error", err)
+				if err = binary.Read(conn, binary.LittleEndian, &size); err != nil {
 					break
 				}
 
-				var size uint32
-				reader := bytes.NewReader(pkt)
-				if err := binary.Read(reader, binary.LittleEndian, &size); err != nil {
-					log.Println("Failed to read packet's size")
-					break
-				}
-
-				if size < 4 || size > MAX_PACKET_SIZE {
+				if size < 0 || size > MAX_PACKET_SIZE {
 					log.Println("got too long packet length:", size)
 					break
 				}
 
-				ln, err = conn.Read(pkt[:size])
-				if err != nil {
-					log.Println("TCP read error", err)
+				if pkt = Arena.Alloc(int(size)); pkt == nil {
+					log.Println("failed to allocate buffer from arena")
 					break
 				}
 
-				dispChanIn <- pkt[:ln]
-			}
+				for size > 0 && err == nil {
+					ln, err = conn.Read(pkt[offset : offset+uint32(size)])
+					size -= int32(ln)
+					offset += uint32(ln)
+				}
 
-			if pkt != nil {
-				Arena.DecRef(pkt)
+				if err != nil {
+					break
+				}
+
+				dispChan <- pkt
 			}
-		}(conn)
+		}(c)
 	}
 
-	log.Println("Shutting down UDP server at '" + ipport + "'")
+	log.Println("Shutting down TCP server at '" + ipport + "'")
 	close(quit)
 	<-done
 }
@@ -181,29 +201,36 @@ func udpServer(ipport string) {
 		log.Fatal("UDP listen error:", e)
 	}
 
+	defer conn.Close()
 	log.Println("UDP server started at '" + ipport + "'")
 
 	/* exiting from udpServer makes dispatcher() exit */
 	quit := make(chan struct{})
 	done := make(chan struct{})
-	dispChanIn, dispChanOut := MakeBufferedChannel()
+	dispChan := make(chan []byte)
 
-	go dispatcher(dispChanOut, quit, done)
+	var ln int
+	var err error
+	var pkt []byte
+	buf := make([]byte, MAX_PACKET_SIZE, MAX_PACKET_SIZE)
+
+	go dispatcher(dispChan, quit, done)
 
 	for {
-		pkt := Arena.Alloc(MAX_PACKET_SIZE)
-		if pkt == nil {
-			panic("failed to allocate buffer from arena")
-		}
+		pkt = nil
 
-		ln, _, err := conn.ReadFrom(pkt)
-		if err != nil {
+		if ln, _, err = conn.ReadFrom(buf); err != nil {
 			log.Println("UDP read error", err)
-			Arena.DecRef(pkt)
 			continue
 		}
 
-		dispChanIn <- pkt[:ln]
+		if pkt = Arena.Alloc(ln); pkt == nil {
+			log.Println("failed to allocate buffer from arena")
+			break
+		}
+
+		copy(pkt, buf)
+		dispChan <- pkt
 	}
 
 	log.Println("Shutting down UDP server at '" + ipport + "'")
@@ -304,7 +331,7 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 				defer wg.Done()
 
 				merger := sereal.NewMerger()
-				//merger.Compression = sereal.SnappyCompressor{Incremental: true}
+				merger.Compression = sereal.SnappyCompressor{Incremental: true}
 
 				for {
 					event, ok := <-mergerChanOut
@@ -340,7 +367,8 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 	wg.Wait()
 
 	if recvCount > 0 {
+		abs_latency := time.Since(epoch)
 		latency := time.Since(epoch.Add(1 * time.Second))
-		log.Printf("finish processing epoch %d, latency %s, merged %d\n", epoch.Unix(), latency, recvCount)
+		log.Printf("finish processing epoch %d, latency %s, absolute latency %s, merged %d\n", epoch.Unix(), latency, abs_latency, recvCount)
 	}
 }
