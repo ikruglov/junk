@@ -24,7 +24,7 @@ import "net/http"
 import _ "net/http/pprof"
 
 const (
-	GOMAXPROCS                = 10
+	GOMAXPROCS                = 20
 	ARENA_SMALLEST_SLAB_CLASS = 128
 	ARENA_START_SIZE          = 128 * 1024 * 1024
 	ARENA_GROW_FACTOR         = 2
@@ -303,6 +303,7 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 			continue
 		}
 
+		header = nil
 		eventType := pkt[:typeEnded]
 		event := pkt[typeEnded+versionEnded+2:]
 
@@ -314,7 +315,7 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 
 		var eventTypePersona string
 		if bytes.Equal(eventType, []byte("WEB")) {
-			eventTypePersona = "WEB-" + string(header["persona"])
+			eventTypePersona = "WEB-" + string(header["__persona__"])
 		} else {
 			eventTypePersona = string(eventType)
 		}
@@ -330,7 +331,10 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 				wg.Add(1)
 				defer wg.Done()
 
+				//log.Println("starting new merger goroutine for", eventType)
+
 				merger := sereal.NewMerger()
+				merger.DedupeStrings = true
 				merger.Compression = sereal.SnappyCompressor{Incremental: true}
 
 				for {
@@ -369,6 +373,6 @@ func processEpoch(epoch time.Time, epochChanOut <-chan []byte) {
 	if recvCount > 0 {
 		abs_latency := time.Since(epoch)
 		latency := time.Since(epoch.Add(1 * time.Second))
-		log.Printf("finish processing epoch %d, latency %s, absolute latency %s, merged %d\n", epoch.Unix(), latency, abs_latency, recvCount)
+		log.Printf("finish processing epoch %d, latency %.2fs, absolute latency %.2f, merged %d\n", epoch.Unix(), latency.Seconds(), abs_latency.Seconds(), recvCount)
 	}
 }
