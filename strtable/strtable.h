@@ -86,9 +86,9 @@ inline void strtable_init(strtable_t *tbl, uint32_t capacity)
     if (!tbl->t) abort();
 }
 
-inline void strtable_free(strtable_t *tbl)
+inline void strtable_clear(strtable_t *tbl)
 {
-    free(tbl);
+    free(tbl->t);
 }
 
 inline void strtable_grow(strtable_t *tbl)
