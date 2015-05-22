@@ -18,7 +18,25 @@
 #define FALLTHROUGH_INTENDED do { } while (0)
 #endif
 
-inline uint32_t leveldb_hash(const char* data, size_t n) {
+static inline
+uint32_t DecodeFixed32(const char* ptr)
+{
+    // if (port::kLittleEndian) {
+        // Load the raw bytes
+        uint32_t result;
+        memcpy(&result, ptr, sizeof(result));  // gcc optimizes this to a plain load
+        return result;
+    // } else {
+        // return ((static_cast<uint32_t>(static_cast<unsigned char>(ptr[0])))
+                // | (static_cast<uint32_t>(static_cast<unsigned char>(ptr[1])) << 8)
+                // | (static_cast<uint32_t>(static_cast<unsigned char>(ptr[2])) << 16)
+                // | (static_cast<uint32_t>(static_cast<unsigned char>(ptr[3])) << 24));
+    // }
+}
+
+static inline uint32_t
+leveldb_hash(const char* data, size_t n)
+{
     // Similar to murmur hash
     const uint32_t seed = 0xbc9f1d34;
     const uint32_t m = 0xc6a4a793;
@@ -28,7 +46,7 @@ inline uint32_t leveldb_hash(const char* data, size_t n) {
 
     // Pick up four bytes at a time
     while (data + 4 <= limit) {
-        uint32_t w = (uint32_t) data;
+        uint32_t w = DecodeFixed32(data);
         data += 4;
         h += w;
         h *= m;
@@ -78,7 +96,8 @@ typedef struct strtable_element strtable_element_t;
  * Library crashes app upon malloc failure
  * */
 
-inline void strtable_init(strtable_t *tbl, uint32_t capacity)
+static inline void
+strtable_init(strtable_t *tbl, uint32_t capacity)
 {
     tbl->keys = 0;
     tbl->capacity = capacity;
@@ -86,12 +105,14 @@ inline void strtable_init(strtable_t *tbl, uint32_t capacity)
     if (!tbl->t) abort();
 }
 
-inline void strtable_clear(strtable_t *tbl)
+static inline
+void strtable_clear(strtable_t *tbl)
 {
     free(tbl->t);
 }
 
-inline void strtable_grow(strtable_t *tbl)
+static inline void
+strtable_grow(strtable_t *tbl)
 {
     uint32_t newslot;
     uint32_t newcap = tbl->capacity * 2;
@@ -120,10 +141,10 @@ inline void strtable_grow(strtable_t *tbl)
     tbl->t = newt;
 }
 
-inline strtable_result_t strtable_insert(strtable_t *tbl, const char *str, uint32_t len, uint32_t value)
+static inline strtable_result_t
+strtable_insert(strtable_t *tbl, uint32_t hash, const char *str, uint32_t len, uint32_t value)
 {
     uint32_t mask = tbl->capacity - 1;
-    uint32_t hash = leveldb_hash(str, len);
     int slot = hash & mask;
 
     strtable_result_t res = { value, 0 };
@@ -153,6 +174,12 @@ inline strtable_result_t strtable_insert(strtable_t *tbl, const char *str, uint3
 
         slot = (slot + 1) & mask;
     }
+}
+
+static inline strtable_result_t
+strtable_insert_leveldb_hash(strtable_t *tbl, const char *str, uint32_t len, uint32_t value)
+{
+    return strtable_insert(tbl, leveldb_hash(str, len), str, len, value);
 }
 
 #endif
