@@ -167,7 +167,8 @@ strtable_insert(strtable_t *tbl, uint32_t hash, const char *str, uint32_t len, u
 
         if (   t[slot].hash == hash
             && t[slot].keylen == len
-            && strncmp(t[slot].key, str, len) == 0
+            && memcmp((const void*) t[slot].key, (const void*) str, len) == 0
+            //&& strncmp(t[slot].key, str, len) == 0
         ) {
             return res;
         }
